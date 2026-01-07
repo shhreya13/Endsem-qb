@@ -5,217 +5,241 @@ from copy import deepcopy
 from collections import defaultdict
 from docx import Document
 from docx.shared import Inches
-from docx.table import _Cell
+from docx.oxml.ns import qn
 import zipfile
-
-st.set_page_config(page_title="EndSem QB Generator (With Bloom's Level)", layout="wide")
 
 # -----------------------
 # Regex & XML Helpers
 # -----------------------
-CO_RE = re.compile(r'CO\s*[_:]?\s*(\d+)', re.I)
-# Updated Bloom's regex to capture K levels (K1-K6)
-BLOOM_RE = re.compile(r'K\s*([1-6])', re.I)
+CO_DESC_RE = re.compile(r'CO(\d)[:\s]+(.*)', re.I)
 NUM_PREFIX_RE = re.compile(r'^\s*(\d+)\s*[\.\)]')
+BLOOM_RE = re.compile(r'K\s*([1-6])', re.I)
 
-def _copy_element(elem):
-    return deepcopy(elem)
+def clean_xml_for_images(element):
+    """Removes drawing and picture tags using local-name to avoid namespace errors."""
+    for drawing in element.xpath(".//*[local-name()='drawing']"):
+        parent = drawing.getparent()
+        if parent is not None:
+            parent.remove(drawing)
+    for pic in element.xpath(".//*[local-name()='pic']"):
+        parent = pic.getparent()
+        if parent is not None:
+            parent.remove(pic)
 
 def replace_cell_with_cell(target_cell, src_cell):
+    """Copies text/formatting but strips original image tags."""
     t_tc = target_cell._tc
-    s_tc = src_cell._tc
+    s_tc = deepcopy(src_cell._tc)
+    
+    clean_xml_for_images(s_tc)
+    
+    original_props = t_tc.get_or_add_tcPr()
+    v_align = original_props.find(qn('w:vAlign'))
+    
     for child in list(t_tc):
-        t_tc.remove(child)
+        if child.tag != qn('w:tcPr'):
+            t_tc.remove(child)
+            
     for child in list(s_tc):
-        t_tc.append(_copy_element(child))
+        if child.tag != qn('w:tcPr'):
+            t_tc.append(child)
+            
+    if v_align is not None:
+        new_props = t_tc.get_or_add_tcPr()
+        new_props.append(deepcopy(v_align))
 
 def extract_images_from_cell(cell):
     images = []
     for blip in cell._element.xpath(".//*[local-name()='blip']"):
         rId = blip.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
         if rId:
-            part = cell.part.related_parts[rId]
-            images.append(BytesIO(part.blob))
+            try:
+                part = cell.part.related_parts[rId]
+                images.append(BytesIO(part.blob))
+            except:
+                continue
     return images
 
-def find_or_pairs(slots):
-    pairs = []
-    for i, s in enumerate(slots):
-        if s.get("is_or"):
-            left = right = None
-            for j in range(i-1, -1, -1):
-                if slots[j].get("slot_num"):
-                    left = slots[j]
-                    break
-            for k in range(i+1, len(slots)):
-                if slots[k].get("slot_num"):
-                    right = slots[k]
-                    break
-            if left and right:
-                pairs.append((left, right))
-    return pairs
-
 # -----------------------
-# Mapping & Extraction
+# Core Logic
 # -----------------------
-def get_tag_for_slot(slot_num, part_c_unit):
-    if 1 <= slot_num <= 2: return "1A"
-    if 3 <= slot_num <= 4: return "2A"
-    if 5 <= slot_num <= 6: return "3A"
-    if 7 <= slot_num <= 8: return "4A"
-    if 9 <= slot_num <= 10: return "5A"
-    if 11 <= slot_num <= 12: return "1B"
-    if 13 <= slot_num <= 14: return "2B"
-    if 15 <= slot_num <= 16: return "3B"
-    if 17 <= slot_num <= 18: return "4B"
-    if 19 <= slot_num <= 20: return "5B"
-    if 21 <= slot_num <= 22: return f"{part_c_unit}C"
-    return None
-
-def extract_questions_from_bank_docx(uploaded_file):
+def extract_bank_data(uploaded_file):
     doc = Document(BytesIO(uploaded_file.read()))
     questions = []
+    co_map = {}
+    
     for table in doc.tables:
-        for row in table.rows:
-            try:
-                cells_text = [c.text.strip() for c in row.cells]
-            except: continue
-            if not any(cells_text): continue
+        rows = table.rows
+        for i, row in enumerate(rows):
+            cells_text = [c.text.strip() for c in row.cells]
+            text_blob = " ".join(cells_text)
+            
+            co_matches = CO_DESC_RE.findall(text_blob)
+            for num, desc in co_matches:
+                if num not in co_map: co_map[num] = desc.strip()
             
             tag = None
             for txt in cells_text:
                 if re.match(r'^[1-5][ABC]$', txt.upper()):
                     tag = txt.upper()
                     break
-            if not tag: continue
-
-            cm = CO_RE.search(" ".join(cells_text))
-            # Extract Bloom's Level from the row
-            bm = BLOOM_RE.search(" ".join(cells_text))
             
-            main_idx = max(range(len(row.cells)), key=lambda i: len(row.cells[i].text))
-            
-            questions.append({
-                "id": random.random(),
-                "tag": tag,
-                "co": cm.group(1) if cm else "",
-                "bloom": f"K{bm.group(1)}" if bm else "", # Store the K level
-                "cell": row.cells[main_idx], 
-                "images": extract_images_from_cell(row.cells[main_idx])
-            })
-    return questions
+            if tag and "ans" not in cells_text[0].lower():
+                bm = BLOOM_RE.search(text_blob)
+                main_idx = max(range(len(row.cells)), key=lambda idx: len(row.cells[idx].text))
+                imgs = extract_images_from_cell(row.cells[main_idx])
+                
+                ans_data = None
+                if i + 1 < len(rows):
+                    next_row_cells = [c.text.strip() for c in rows[i+1].cells]
+                    if "ans" in next_row_cells[0].lower():
+                        ans_idx = max(range(len(rows[i+1].cells)), key=lambda idx: len(rows[i+1].cells[idx].text))
+                        ans_data = rows[i+1].cells[ans_idx].text
 
-# -----------------------
-# Assembly Logic
-# -----------------------
-def assemble_doc(template_file_bytes, selected_map):
-    doc = Document(BytesIO(template_file_bytes))
+                questions.append({
+                    "id": random.random(),
+                    "tag": tag,
+                    "bloom": f"K{bm.group(1)}" if bm else "",
+                    "q_cell": row.cells[main_idx], 
+                    "ans_text": ans_data,
+                    "images": imgs
+                })
+    return questions, co_map
+
+def get_tag_for_slot(slot_num, exam_type, part_c_choice, endsem_unit=None):
+    if exam_type == "EndSem":
+        mapping = {
+            1:"1A", 2:"1A", 3:"2A", 4:"2A", 5:"3A", 6:"3A", 7:"4A", 8:"4A", 9:"5A", 10:"5A", 
+            11:"1B", 12:"1B", 13:"2B", 14:"2B", 15:"3B", 16:"3B", 17:"4B", 18:"4B", 19:"5B", 20:"5B"
+        }
+        if slot_num in mapping: return mapping[slot_num]
+        if slot_num in [21, 22]: return f"{endsem_unit}C"
+
+    elif exam_type == "CAT 1":
+        if slot_num in [1, 2]: return "1A"
+        if slot_num in [3, 4]: return "2A"
+        if slot_num == 5: return random.choice(["1A", "2A"])
+        if slot_num in [6, 7]: return "1B"
+        if slot_num in [8, 9]: return "2B"
+        if slot_num in [10, 11]: return f"{part_c_choice}C"
+
+    elif exam_type == "CAT 2":
+        if slot_num in [1, 2]: return "3A"
+        if slot_num in [3, 4]: return "4A"
+        if slot_num == 5: return random.choice(["3A", "4A"])
+        if slot_num in [6, 7]: return "3B"
+        if slot_num in [8, 9]: return "4B"
+        if slot_num in [10, 11]: return f"{part_c_choice}C"
+
+    return None
+
+def assemble_doc(template_bytes, selected_map, co_desc, mode):
+    doc = Document(BytesIO(template_bytes))
+    for table in doc.tables:
+        for row in table.rows:
+            txt = "".join([c.text for c in row.cells]).strip()
+            for i in range(1, 6):
+                if txt.startswith(f"CO{i}") and len(row.cells) >= 3:
+                    row.cells[2].text = co_desc.get(str(i), f"Course Outcome {i}")
+
     for (ti, ri, ci), q in selected_map.items():
         table = doc.tables[ti]
-        tr = table.rows[ri]._tr
-        cells_xml = tr.tc_lst
+        row = table.rows[ri]
+        q_target, co_target = row.cells[1], row.cells[2]
+        k_target = row.cells[3] if len(row.cells) > 3 else None
         
-        # Mapping: Col 0: No., Col 1: Question, Col 2: CO, Col 3: Bloom's Level
-        q_cell = _Cell(cells_xml[1], table)
-        co_cell = _Cell(cells_xml[2], table)
-        
-        q_cell.text = ""
-        co_cell.text = ""
-
         if q == "TAG_NOT_FOUND":
-            q_cell.text = "Error: Tag not found in QB"
+            q_target.text = "Error: Tag missing in Bank"
         else:
-            replace_cell_with_cell(q_cell, q["cell"])
-            # Clear drawing errors
-            for p in q_cell.paragraphs:
-                for run in list(p.runs):
-                    if run._element.find('.//w:drawing', namespaces={'w':"http://schemas.openxmlformats.org/wordprocessingml/2006/main"}) is not None:
-                        p._element.remove(run._element)
-            # Re-insert images
-            for img in q.get("images", []):
-                img.seek(0)
-                q_cell.add_paragraph().add_run().add_picture(img, width=Inches(2.5))
+            replace_cell_with_cell(q_target, q["q_cell"])
+            if q.get("images"):
+                for img_blob in q["images"]:
+                    img_blob.seek(0)
+                    p = q_target.add_paragraph()
+                    r = p.add_run()
+                    r.add_picture(img_blob, width=Inches(2.0))
+            if mode == "Faculty" and q.get("ans_text"):
+                p = q_target.add_paragraph()
+                p.add_run("\nAnswer: ").bold = True
+                p.add_run(q["ans_text"])
+            co_target.text = f"CO{q['tag'][0]}"
+            if k_target: k_target.text = q.get('bloom', '')
             
-            co_cell.text = f"CO{q.get('co','')}"
-            
-            # THE FIX: Fill the 4th column (Bloom's Level) with the K value
-            if len(cells_xml) > 3:
-                k_cell = _Cell(cells_xml[3], table)
-                k_cell.text = q.get('bloom', '')
-
     buf = BytesIO()
     doc.save(buf)
-    buf.seek(0)
-    return buf
+    return buf.getvalue()
 
 # -----------------------
-# Standard Parsing & UI
+# Streamlit App
 # -----------------------
-def parse_template_slots(template_file_bytes):
-    doc = Document(BytesIO(template_file_bytes))
-    slots = []
-    for ti, table in enumerate(doc.tables):
-        for ri, row in enumerate(table.rows):
-            tr = row._tr
-            for ci, tc in enumerate(tr.tc_lst):
-                cell = _Cell(tc, table)
-                txt = cell.text.strip()
-                if txt.upper() in ["OR", "(OR)", "( OR )"]:
-                    slots.append({"table_index": ti, "row_index": ri, "cell_index": ci, "slot_num": None, "is_or": True})
-                else:
-                    m = NUM_PREFIX_RE.match(txt)
-                    if m:
-                        slots.append({"table_index": ti, "row_index": ri, "cell_index": ci, "slot_num": int(m.group(1)), "is_or": False})
-    return slots
+st.set_page_config(page_title="QP Generator", layout="wide")
+st.title("📑 QP Dashboard")
 
-def select_questions_by_tag(entries, or_pairs, questions, part_c_unit):
-    selected = {}
-    used_q_ids = set() 
-    by_tag = defaultdict(list)
-    for q in questions:
-        by_tag[q["tag"]].append(q)
+if "s_zip" not in st.session_state:
+    st.session_state.s_zip = None
+    st.session_state.f_zip = None
 
-    def pick_for_slot(slot_num):
-        target_tag = get_tag_for_slot(slot_num, part_c_unit)
-        pool = by_tag.get(target_tag, [])
-        available = [q for q in pool if q["id"] not in used_q_ids]
-        if not available: return "TAG_NOT_FOUND" if not pool else random.choice(pool)
-        chosen_q = random.choice(available)
-        used_q_ids.add(chosen_q["id"])
-        return chosen_q
-
-    for left, right in or_pairs:
-        selected[(left["table_index"], left["row_index"], left["cell_index"])] = pick_for_slot(left["slot_num"])
-        selected[(right["table_index"], right["row_index"], right["cell_index"])] = pick_for_slot(right["slot_num"])
-
-    for e in entries:
-        coord = (e["table_index"], e["row_index"], e["cell_index"])
-        if coord not in selected:
-            selected[coord] = pick_for_slot(e["slot_num"])
-
-    return selected
-
-st.title("📑 QP Generator (Including K-Levels)")
 with st.sidebar:
+    st.header("Files")
     t_file = st.file_uploader("Template", type="docx")
-    b_file = st.file_uploader("Question Bank", type="docx")
-    n_sets = st.number_input("Sets", 1, 10, 1)
-    part_c_unit = st.selectbox("Part C Unit", [1, 2, 3, 4, 5])
+    b_file = st.file_uploader("Bank", type="docx")
+    st.header("Settings")
+    # MAX 3 SETS REQUIREMENT
+    n_sets = st.number_input("Sets", 1, 3, 1)
+    exam = st.radio("Exam", ["CAT 1", "CAT 2", "EndSem"])
+    pc, uc = None, None
+    if exam == "EndSem": 
+        uc = st.selectbox("Unit Part C", [1,2,3,4,5])
+    elif exam == "CAT 1": 
+        pc = st.selectbox("Unit Part C", [1,2])
+    else: 
+        pc = st.selectbox("Unit Part C", [3,4])
 
-if st.button("Generate") and t_file and b_file:
-    qb_questions = extract_questions_from_bank_docx(b_file)
-    template_bytes = t_file.read()
-    slots = parse_template_slots(template_bytes)
-    entries = [s for s in slots if s.get("slot_num")]
-    or_pairs = find_or_pairs(slots)
-    
-    zip_buf = BytesIO()
-    with zipfile.ZipFile(zip_buf, "w") as z:
-        for i in range(n_sets):
-            selected = select_questions_by_tag(entries, or_pairs, qb_questions, part_c_unit)
-            final_doc = assemble_doc(template_bytes, selected)
-            z.writestr(f"Set_{i+1}.docx", final_doc.getvalue())
-            st.download_button(f"Download Set {i+1}", final_doc, f"Set_{i+1}.docx")
-    
-    zip_buf.seek(0)
-    st.download_button("Download All (ZIP)", zip_buf, "All_Sets.zip")
+if st.button("🚀 Generate"):
+    if t_file and b_file:
+        with st.spinner("Processing..."):
+            questions, co_desc = extract_bank_data(b_file)
+            t_bytes = t_file.read()
+            doc_t = Document(BytesIO(t_bytes))
+            slots = []
+            for ti, table in enumerate(doc_t.tables):
+                for ri, row in enumerate(table.rows):
+                    for ci, cell in enumerate(row.cells):
+                        m = NUM_PREFIX_RE.match(cell.text.strip())
+                        if m: slots.append({"ti": ti, "ri": ri, "ci": ci, "sn": int(m.group(1))})
+            
+            s_buf, f_buf = BytesIO(), BytesIO()
+            # GLOBAL TRACKING TO PREVENT REPETITION ACROSS SETS
+            global_used = set()
+            
+            with zipfile.ZipFile(s_buf, "w") as sz, zipfile.ZipFile(f_buf, "w") as fz:
+                for i in range(n_sets):
+                    current_set_selection = {}
+                    by_tag = defaultdict(list)
+                    for q in questions: by_tag[q["tag"]].append(q)
+                    
+                    for s in slots:
+                        tag = get_tag_for_slot(s["sn"], exam, pc, uc)
+                        # Filter out questions already used in ANY previous set
+                        pool = [q for q in by_tag.get(tag, []) if q["id"] not in global_used]
+                        
+                        if not pool:
+                            # Fallback if the bank runs out of unique questions
+                            chosen = "TAG_NOT_FOUND"
+                        else:
+                            chosen = random.choice(pool)
+                            global_used.add(chosen["id"])
+                            
+                        current_set_selection[(s["ti"], s["ri"], s["ci"])] = chosen
+                    
+                    sz.writestr(f"Set_{i+1}_Student.docx", assemble_doc(t_bytes, current_set_selection, co_desc, "Student"))
+                    fz.writestr(f"Set_{i+1}_Faculty.docx", assemble_doc(t_bytes, current_set_selection, co_desc, "Faculty"))
+            
+            st.session_state.s_zip = s_buf.getvalue()
+            st.session_state.f_zip = f_buf.getvalue()
+            st.success("Documents Ready! No questions are repeated across sets.")
+
+if st.session_state.s_zip:
+    c1, c2 = st.columns(2)
+    c1.download_button("Download Student ZIP", st.session_state.s_zip, "Student.zip")
+    c2.download_button("Download Faculty ZIP", st.session_state.f_zip, "Faculty.zip")
